@@ -1,0 +1,763 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>tilt-golf</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#000; overflow:hidden; cursor:crosshair; }
+  canvas { display:block; width:100vw; height:100vh; }
+
+  #hud {
+    position:absolute; top:18px; left:50%; transform:translateX(-50%);
+    background:rgba(0,0,0,0.5); backdrop-filter:blur(6px);
+    border:1px solid rgba(255,255,255,0.12); border-radius:10px;
+    padding:8px 24px; color:#fff; text-align:center; pointer-events:none;
+  }
+  #hud .label { font:11px/1 'Segoe UI',sans-serif; letter-spacing:2px; text-transform:uppercase; opacity:.5; }
+  #hud .timer { font:700 28px/1.2 'Segoe UI',sans-serif; font-variant-numeric:tabular-nums; }
+
+  #hint {
+    position:absolute; bottom:18px; left:50%; transform:translateX(-50%);
+    background:rgba(0,0,0,0.4); border-radius:8px; padding:7px 16px;
+    color:rgba(255,255,255,0.5); font:12px 'Segoe UI',sans-serif;
+    pointer-events:none; letter-spacing:1px;
+  }
+
+  #overlay {
+    position:absolute; inset:0; display:flex; flex-direction:column;
+    align-items:center; justify-content:center;
+    background:rgba(5,10,5,0.88); backdrop-filter:blur(10px);
+    color:#fff; text-align:center;
+  }
+  #overlay.hidden { display:none; }
+  #overlay h1 { font:800 48px/1 'Segoe UI',sans-serif; letter-spacing:-1px; margin-bottom:10px; }
+  #overlay .sub { font:16px 'Segoe UI',sans-serif; opacity:.55; margin-bottom:30px; }
+  #overlay button {
+    padding:13px 38px; font:700 15px 'Segoe UI',sans-serif;
+    background:#4caf50; color:#fff; border:none; border-radius:9px;
+    cursor:pointer; letter-spacing:.5px; transition:background .15s;
+  }
+  #overlay button:hover { background:#66bb6a; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <div class="label">Time</div>
+  <div class="timer" id="timer">0:00.0</div>
+</div>
+<div id="hint">Move mouse up/down to tilt · left/right to steer</div>
+<div id="overlay">
+  <h1>⛳ super-monkey-golf</h1>
+  <div class="sub">Tilt the stage with your mouse · reach the goal</div>
+  <button id="startBtn">Start</button>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/gl-matrix/2.8.1/gl-matrix-min.js"></script>
+<script>
+'use strict';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WebGLContext
+// Creates and owns the WebGL2 rendering context. Handles canvas resizing.
+// Everything else receives the gl handle from here.
+// ─────────────────────────────────────────────────────────────────────────────
+class WebGLContext {
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.gl = canvas.getContext('webgl2', { antialias: true, alpha: false });
+    if (!this.gl) throw new Error('WebGL2 not supported');
+    this.resize();
+    window.addEventListener('resize', () => this.resize());
+  }
+  resize() {
+    this.canvas.width  = window.innerWidth;
+    this.canvas.height = window.innerHeight;
+    this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+  }
+  get aspect() { return this.canvas.width / this.canvas.height; }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shader
+// Compiles a vertex + fragment GLSL pair into a linked program.
+// Caches uniform locations so we never call getUniformLocation twice.
+// ─────────────────────────────────────────────────────────────────────────────
+class Shader {
+  constructor(gl, vert, frag) {
+    this.gl   = gl;
+    this.prog = this._link(vert, frag);
+    this._u   = {};
+  }
+  _compile(type, src) {
+    const s = this.gl.createShader(type);
+    this.gl.shaderSource(s, src);
+    this.gl.compileShader(s);
+    if (!this.gl.getShaderParameter(s, this.gl.COMPILE_STATUS))
+      throw new Error(this.gl.getShaderInfoLog(s));
+    return s;
+  }
+  _link(v, f) {
+    const p = this.gl.createProgram();
+    this.gl.attachShader(p, this._compile(this.gl.VERTEX_SHADER,   v));
+    this.gl.attachShader(p, this._compile(this.gl.FRAGMENT_SHADER, f));
+    this.gl.linkProgram(p);
+    if (!this.gl.getProgramParameter(p, this.gl.LINK_STATUS))
+      throw new Error(this.gl.getProgramInfoLog(p));
+    return p;
+  }
+  use()          { this.gl.useProgram(this.prog); }
+  _loc(n)        { return this._u[n] ?? (this._u[n] = this.gl.getUniformLocation(this.prog, n)); }
+  setMat4(n, v)  { this.gl.uniformMatrix4fv(this._loc(n), false, v); }
+  setVec3(n, v)  { this.gl.uniform3fv(this._loc(n), v); }
+  setVec2(n, v)  { this.gl.uniform2fv(this._loc(n), v); }
+  setFloat(n, v) { this.gl.uniform1f(this._loc(n), v); }
+  setInt(n, v)   { this.gl.uniform1i(this._loc(n), v); }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GLSL source — Phong lighting with checkerboard floor support
+//
+// VERT: transforms vertices into clip space, passes world position + normal
+//       to the fragment shader for lighting.
+//
+// FRAG: computes Phong shading (ambient + diffuse + specular) from one
+//       directional light and one point light. When uGrid is true, tiles
+//       a checkerboard using world-space XZ coords so tiles stay 1×1 unit
+//       regardless of mesh size. Grid only applies to upward-facing faces
+//       (N.y > 0.5) — sides render as solid dark green.
+// ─────────────────────────────────────────────────────────────────────────────
+const VERT = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNorm;
+layout(location=2) in vec2 aUV;
+uniform mat4 uModel, uView, uProj, uNorm;
+out vec3 vNorm, vWorld;
+out vec2 vUV;
+void main(){
+  vec4 w   = uModel * vec4(aPos, 1.0);
+  vWorld   = w.xyz;
+  vNorm    = mat3(uNorm) * aNorm;
+  vUV      = aUV;
+  gl_Position = uProj * uView * w;
+}`;
+
+const FRAG = `#version 300 es
+precision highp float;
+in vec3 vNorm, vWorld;
+in vec2 vUV;
+uniform vec3 uColor, uCamPos;
+uniform vec3 uDirDir, uDirCol;
+uniform vec3 uPtPos,  uPtCol;
+uniform bool uGrid;
+out vec4 fragColor;
+void main(){
+  vec3 col = uColor;
+  if (uGrid) {
+    vec3 N = normalize(vNorm);
+    if (N.y > 0.5) {
+      vec2 t     = floor(vec2(vWorld.x, vWorld.z));
+      float check = mod(t.x + t.y, 2.0);
+      col = mix(vec3(0.24,0.52,0.20), vec3(0.42,0.78,0.36), check);
+    } else {
+      col = vec3(0.20, 0.44, 0.18);
+    }
+  }
+  vec3 N  = normalize(vNorm);
+  vec3 V  = normalize(uCamPos - vWorld);
+  vec3 amb = 0.30 * col;
+  vec3 L1  = normalize(-uDirDir);
+  float d1 = max(dot(N,L1), 0.0);
+  vec3 R1  = reflect(-L1, N);
+  float s1 = pow(max(dot(V,R1), 0.0), 28.0);
+  vec3 dir = (d1*col + s1*0.3) * uDirCol;
+  vec3 L2  = normalize(uPtPos - vWorld);
+  float at = 1.0 / (1.0 + 0.04*length(uPtPos - vWorld));
+  float d2 = max(dot(N,L2), 0.0);
+  vec3 R2  = reflect(-L2, N);
+  float s2 = pow(max(dot(V,R2), 0.0), 48.0);
+  vec3 pt  = at * (d2*col + s2*0.4) * uPtCol;
+  fragColor = vec4(amb + dir + pt, 1.0);
+}`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Geometry builders
+// Pure CPU functions — return typed arrays, never touch the GPU.
+// buildBox  → 6 faces, 2 triangles each, with normals and UVs
+// buildSphere → UV sphere with shared-vertex index buffer
+// ─────────────────────────────────────────────────────────────────────────────
+function buildBox(w, h, d) {
+  const hw=w/2, hh=h/2, hd=d/2;
+  const verts=[], norms=[], uvs=[], idx=[];
+  const faces = [
+    { n:[0,0, 1], p:[[-hw,-hh,hd],[hw,-hh,hd],[hw,hh,hd],[-hw,hh,hd]] },
+    { n:[0,0,-1], p:[[hw,-hh,-hd],[-hw,-hh,-hd],[-hw,hh,-hd],[hw,hh,-hd]] },
+    { n:[0, 1,0], p:[[-hw,hh,hd],[hw,hh,hd],[hw,hh,-hd],[-hw,hh,-hd]] },
+    { n:[0,-1,0], p:[[-hw,-hh,-hd],[hw,-hh,-hd],[hw,-hh,hd],[-hw,-hh,hd]] },
+    { n:[ 1,0,0], p:[[hw,-hh,hd],[hw,-hh,-hd],[hw,hh,-hd],[hw,hh,hd]] },
+    { n:[-1,0,0], p:[[-hw,-hh,-hd],[-hw,-hh,hd],[-hw,hh,hd],[-hw,hh,-hd]] },
+  ];
+  let base = 0;
+  for (const f of faces) {
+    for (let i=0; i<4; i++) {
+      verts.push(...f.p[i]);
+      norms.push(...f.n);
+      uvs.push(i<2?0:1, i===0||i===3?0:1);
+    }
+    idx.push(base,base+1,base+2, base,base+2,base+3);
+    base += 4;
+  }
+  return { verts:new Float32Array(verts), norms:new Float32Array(norms), uvs:new Float32Array(uvs), idx:new Uint16Array(idx) };
+}
+
+function buildSphere(r, stacks=18, slices=28) {
+  const verts=[], norms=[], uvs=[], idx=[];
+  for (let i=0; i<=stacks; i++) {
+    const phi = Math.PI * i / stacks;
+    for (let j=0; j<=slices; j++) {
+      const theta = 2*Math.PI * j / slices;
+      const x=Math.sin(phi)*Math.cos(theta), y=Math.cos(phi), z=Math.sin(phi)*Math.sin(theta);
+      verts.push(r*x,r*y,r*z); norms.push(x,y,z); uvs.push(j/slices, i/stacks);
+    }
+  }
+  for (let i=0; i<stacks; i++) {
+    for (let j=0; j<slices; j++) {
+      const a=i*(slices+1)+j, b=a+slices+1;
+      idx.push(a,b,a+1, b,b+1,a+1);
+    }
+  }
+  return { verts:new Float32Array(verts), norms:new Float32Array(norms), uvs:new Float32Array(uvs), idx:new Uint16Array(idx) };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VAO
+// Uploads geometry to the GPU once. Owns VBOs for position (loc 0),
+// normal (loc 1), and UV (loc 2), plus an element array buffer for indices.
+// bind() / draw() are called every frame.
+// ─────────────────────────────────────────────────────────────────────────────
+class VAO {
+  constructor(gl, geo) {
+    this.gl    = gl;
+    this.count = geo.idx.length;
+    this.vao   = gl.createVertexArray();
+    gl.bindVertexArray(this.vao);
+    this._buf(gl, 0, geo.verts, 3);
+    this._buf(gl, 1, geo.norms, 3);
+    this._buf(gl, 2, geo.uvs,   2);
+    const eb = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, eb);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, geo.idx, gl.STATIC_DRAW);
+    gl.bindVertexArray(null);
+  }
+  _buf(gl, loc, data, size) {
+    const b = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, b);
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+  }
+  bind()   { this.gl.bindVertexArray(this.vao); }
+  draw()   { this.gl.drawElements(this.gl.TRIANGLES, this.count, this.gl.UNSIGNED_SHORT, 0); }
+  unbind() { this.gl.bindVertexArray(null); }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Mesh
+// Pairs a VAO with a world transform (position, rotation, scale) and colour.
+// matrix() rebuilds the mat4 only when a transform value has changed (dirty flag).
+// ─────────────────────────────────────────────────────────────────────────────
+class Mesh {
+  constructor(vao, color=[1,1,1]) {
+    this.vao    = vao;
+    this.color  = color;
+    this.pos    = vec3.create();
+    this.rot    = vec3.create();
+    this.scl    = vec3.fromValues(1,1,1);
+    this._mat   = mat4.create();
+    this._dirty = true;
+  }
+  setPos(x,y,z) { vec3.set(this.pos,x,y,z); this._dirty=true; }
+  setRot(x,y,z) { vec3.set(this.rot,x,y,z); this._dirty=true; }
+  setScl(x,y,z) { vec3.set(this.scl,x,y,z); this._dirty=true; }
+  matrix() {
+    if (!this._dirty) return this._mat;
+    mat4.identity(this._mat);
+    mat4.translate(this._mat, this._mat, this.pos);
+    mat4.rotateY(this._mat, this._mat, this.rot[1]);
+    mat4.rotateX(this._mat, this._mat, this.rot[0]);
+    mat4.rotateZ(this._mat, this._mat, this.rot[2]);
+    mat4.scale(this._mat, this._mat, this.scl);
+    this._dirty = false;
+    return this._mat;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RigidBody
+// Stores position, velocity, and accumulated force for one physics object.
+// integrate(dt) uses semi-implicit Euler: update velocity from force first,
+// then update position from the new velocity. More stable than explicit Euler.
+// ─────────────────────────────────────────────────────────────────────────────
+class RigidBody {
+  constructor(radius=0.3, mass=1) {
+    this.radius      = radius;
+    this.mass        = mass;
+    this.pos         = vec3.create();
+    this.vel         = vec3.create();
+    this._force      = vec3.create();
+    this.restitution = 0.35;  // bounciness
+    this.linearDamp  = 0.998; // tiny drag per frame
+    this.friction    = 0.982; // surface friction on flat contacts
+  }
+  applyForce(x,y,z) { this._force[0]+=x; this._force[1]+=y; this._force[2]+=z; }
+  integrate(dt) {
+    this.vel[0] += (this._force[0]/this.mass)*dt;
+    this.vel[1] += (this._force[1]/this.mass)*dt;
+    this.vel[2] += (this._force[2]/this.mass)*dt;
+    this.vel[0] *= this.linearDamp;
+    this.vel[1] *= this.linearDamp;
+    this.vel[2] *= this.linearDamp;
+    this.pos[0] += this.vel[0]*dt;
+    this.pos[1] += this.vel[1]*dt;
+    this.pos[2] += this.vel[2]*dt;
+    vec3.set(this._force, 0, 0, 0);
+  }
+  get speed() { return vec3.length(this.vel); }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PhysicsWorld
+// Owns all bodies and colliders. Each step:
+//   1. Smoothly lerps the gravity direction toward the mouse-driven target
+//   2. Applies tilted gravity force to every body
+//   3. Integrates all bodies
+//   4. Resolves collisions (AABB only for MVP)
+//
+// The gravity direction is a unit vector, not a scalar. Tilting it away from
+// straight-down is what makes the stage feel like it's physically rolling.
+// ─────────────────────────────────────────────────────────────────────────────
+class PhysicsWorld {
+  constructor() {
+    this.gravMag   = 36;
+    // Start with a small permanent forward lean so the ball rolls on its own
+    const BASE     = 0.24; // ~14 degrees
+    this.gravDir   = vec3.fromValues(0, -Math.cos(BASE), -Math.sin(BASE));
+    this._target   = vec3.clone(this.gravDir);
+    this.tiltSpeed = 6;
+    this.bodies    = [];
+    this.colliders = [];
+  }
+
+  // Convert mouse position into a target gravity direction.
+  // ny=+1 (top of screen) = steeper forward tilt = faster
+  // ny=-1 (bottom)        = reverse tilt = ball rolls back
+  // nx drives left/right lean
+  setMouseTilt(nx, ny) {
+    const BASE     = 0.24;
+    const MAX_FWD  = 0.52;  // ~30° max forward
+    const MAX_BACK = -0.20; // ~11° max reverse
+    const MAX_SIDE = 0.35;  // ~20° max side lean
+
+    const fwdAngle = ny >= 0
+      ? BASE + ny * (MAX_FWD  - BASE)
+      : BASE + ny * (BASE - MAX_BACK);
+    const fwd    = Math.max(MAX_BACK, Math.min(MAX_FWD, fwdAngle));
+    const side   = Math.max(-MAX_SIDE, Math.min(MAX_SIDE, nx * MAX_SIDE));
+
+    const nz  = -Math.sin(fwd);
+    const nx2 =  Math.sin(side);
+    const ny2 = -Math.sqrt(Math.max(0.001, 1 - nz*nz - nx2*nx2));
+    vec3.set(this._target, nx2, ny2, nz);
+  }
+
+  addBody(b)     { this.bodies.push(b); }
+  addCollider(c) { this.colliders.push(c); }
+  clearCol()     { this.colliders = []; }
+
+  step(dt) {
+    // Exponential lerp — gives the tilt a weighted, physical feel
+    const alpha = 1 - Math.pow(0.01, dt * this.tiltSpeed);
+    vec3.lerp(this.gravDir, this.gravDir, this._target, alpha);
+    vec3.normalize(this.gravDir, this.gravDir);
+
+    for (const b of this.bodies) {
+      b.applyForce(
+        this.gravDir[0] * b.mass * this.gravMag,
+        this.gravDir[1] * b.mass * this.gravMag,
+        this.gravDir[2] * b.mass * this.gravMag
+      );
+      b.integrate(dt);
+    }
+    this._resolve();
+  }
+
+  // Sphere-vs-AABB: find closest point on box to sphere centre.
+  // If closer than radius, push ball out and reflect velocity.
+  _resolve() {
+    for (const b of this.bodies) {
+      const r = b.radius;
+      for (const col of this.colliders) {
+        const cx=b.pos[0], cy=b.pos[1], cz=b.pos[2];
+        const px=Math.max(col.min[0],Math.min(cx,col.max[0]));
+        const py=Math.max(col.min[1],Math.min(cy,col.max[1]));
+        const pz=Math.max(col.min[2],Math.min(cz,col.max[2]));
+        const dx=cx-px, dy=cy-py, dz=cz-pz;
+        const dist = Math.sqrt(dx*dx+dy*dy+dz*dz);
+        if (dist >= r) continue;
+        const depth = r - dist;
+        let nx=0, ny=1, nz=0;
+        if (dist > 0.0001) { nx=dx/dist; ny=dy/dist; nz=dz/dist; }
+        b.pos[0]+=nx*depth; b.pos[1]+=ny*depth; b.pos[2]+=nz*depth;
+        const vdn = b.vel[0]*nx + b.vel[1]*ny + b.vel[2]*nz;
+        if (vdn < 0) {
+          b.vel[0] -= (1+b.restitution)*vdn*nx;
+          b.vel[1] -= (1+b.restitution)*vdn*ny;
+          b.vel[2] -= (1+b.restitution)*vdn*nz;
+          if (ny > 0.5) { b.vel[0]*=b.friction; b.vel[2]*=b.friction; }
+        }
+      }
+    }
+  }
+
+  // Extract tilt angles from the live gravity vector for the visual stage rotation
+  tiltAngles() {
+    const g = this.gravDir;
+    return {
+      rx:  Math.asin(Math.max(-1, Math.min(1, g[2]))),
+      rz: -Math.asin(Math.max(-1, Math.min(1, g[0])))
+    };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Camera
+// Smooth follow-cam that sits behind and above the ball.
+// Course runs in the -Z direction, so camera is placed at +Z relative to ball.
+// ─────────────────────────────────────────────────────────────────────────────
+class Camera {
+  constructor(aspect) {
+    this.aspect  = aspect;
+    this.fov     = 58 * Math.PI/180;
+    this.near    = 0.1;
+    this.far     = 400;
+    this._smooth = vec3.create();
+    this.eye     = vec3.create();
+    this.viewMat = mat4.create();
+    this.projMat = mat4.create();
+    this.dist    = 12;
+    this.height  = 6;
+  }
+  update(ballPos, dt) {
+    // Exponential smooth follow
+    const alpha = 1 - Math.pow(0.008, dt);
+    vec3.lerp(this._smooth, this._smooth, ballPos, alpha);
+    vec3.set(this.eye,
+      this._smooth[0],
+      this._smooth[1] + this.height,
+      this._smooth[2] + this.dist   // +Z = behind ball
+    );
+    mat4.lookAt(this.viewMat, this.eye, this._smooth, [0,1,0]);
+    mat4.perspective(this.projMat, this.fov, this.aspect, this.near, this.far);
+  }
+  setAspect(a) { this.aspect = a; }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Renderer
+// Drives the forward rendering pass. Every frame:
+//   - Stage meshes are drawn with the tilt matrix pre-multiplied onto their
+//     model matrix — this makes the world visually rotate around the ball
+//     to match what the physics are doing.
+//   - The ball is drawn without the tilt (it lives in physics world space).
+// ─────────────────────────────────────────────────────────────────────────────
+class Renderer {
+  constructor(ctx, shader) {
+    this.ctx      = ctx;
+    this.gl       = ctx.gl;
+    this.shader   = shader;
+    this._tiltMat = mat4.create();
+  }
+
+  // Build a rotation matrix pivoted around the ball position.
+  // translate(pivot) → rotateX → rotateZ → translate(-pivot)
+  setTilt(rx, rz, pivot) {
+    const neg = vec3.create();
+    vec3.negate(neg, pivot);
+    mat4.identity(this._tiltMat);
+    mat4.translate(this._tiltMat, this._tiltMat, pivot);
+    mat4.rotateX(this._tiltMat, this._tiltMat, rx);
+    mat4.rotateZ(this._tiltMat, this._tiltMat, rz);
+    mat4.translate(this._tiltMat, this._tiltMat, neg);
+  }
+
+  _draw(mesh, applyTilt=false, grid=false) {
+    const { shader, gl } = this;
+    let model = mesh.matrix();
+    if (applyTilt) {
+      const t = mat4.create();
+      mat4.multiply(t, this._tiltMat, model);
+      model = t;
+    }
+    shader.setMat4('uModel', model);
+    const nm = mat4.create();
+    mat4.invert(nm, model);
+    mat4.transpose(nm, nm);
+    shader.setMat4('uNorm', nm);
+    shader.setVec3('uColor', mesh.color);
+    shader.setInt('uGrid', grid ? 1 : 0);
+    mesh.vao.bind();
+    mesh.vao.draw();
+    mesh.vao.unbind();
+  }
+
+  frame(stageMeshes, ballMesh, camera, lightDir, lightCol, ptPos, ptCol) {
+    const { gl, shader } = this;
+    gl.clearColor(0.53, 0.81, 0.98, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST);
+
+    shader.use();
+    shader.setMat4('uView',   camera.viewMat);
+    shader.setMat4('uProj',   camera.projMat);
+    shader.setVec3('uCamPos', camera.eye);
+    shader.setVec3('uDirDir', lightDir);
+    shader.setVec3('uDirCol', lightCol);
+    shader.setVec3('uPtPos',  ptPos);
+    shader.setVec3('uPtCol',  ptCol);
+
+    // Stage — drawn with tilt, floor mesh gets the grid shader
+    for (const m of stageMeshes) this._draw(m, true, m._isFloor || false);
+
+    // Ball — no tilt applied, position comes from physics
+    this._draw(ballMesh, false, false);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// InputManager
+// Tracks mouse input via the Pointer Lock API.
+// Raw movementX/Y deltas accumulate into nx/ny in [-1, 1].
+// This means tilt persists where you left it when the mouse stops —
+// unlike absolute position which would snap back on mouse-out.
+// ─────────────────────────────────────────────────────────────────────────────
+class InputManager {
+  constructor(canvas) {
+    this.nx      = 0;
+    this.ny      = 0;
+    this.sensX   = 0.003;
+    this.sensY   = 0.003;
+    this._canvas = canvas;
+    this._locked = false;
+    this._active = false;
+
+    document.addEventListener('pointerlockchange', () => {
+      this._locked = document.pointerLockElement === canvas;
+    });
+
+    window.addEventListener('mousemove', e => {
+      if (!this._active) return;
+      this.nx = Math.max(-1, Math.min(1, this.nx + e.movementX * this.sensX));
+      this.ny = Math.max(-1, Math.min(1, this.ny - e.movementY * this.sensY));
+    });
+
+    canvas.addEventListener('click', () => {
+      if (this._active && !this._locked) canvas.requestPointerLock();
+    });
+  }
+
+  activate() {
+    this._active = true;
+    this._canvas.requestPointerLock();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Level
+// Single flat rectangular stage. Builds the floor mesh + AABB collider,
+// and a goal marker with flag. No walls — ball falls off and respawns.
+// ─────────────────────────────────────────────────────────────────────────────
+class Level {
+  constructor(gl) {
+    this.ballStart  = [0, 0.5, 2];
+    this.goalPos    = [0, 0.1, -28];
+    this.goalRadius = 0.8;
+    this.outY       = -6;
+
+    // Floor slab — 7 units wide, 0.6 thick, 64 units long
+    const W=7, D=64;
+    this.floorMesh = new Mesh(new VAO(gl, buildBox(W, 0.6, D)), [1,1,1]);
+    this.floorMesh.setPos(0, -0.3, -29);
+    this.floorMesh._isFloor = true;
+
+    this.floorCol = {
+      min: vec3.fromValues(-W/2, -0.6, -29-D/2),
+      max: vec3.fromValues( W/2,  0.0, -29+D/2)
+    };
+
+    // Goal marker — flat yellow square
+    this.goalMesh = new Mesh(new VAO(gl, buildBox(this.goalRadius*2, 0.06, this.goalRadius*2)), [1.0,0.85,0.0]);
+    this.goalMesh.setPos(...this.goalPos);
+
+    // Flag pole + flag
+    this.poleMesh = new Mesh(new VAO(gl, buildBox(0.06,1.2,0.06)), [0.9,0.9,0.9]);
+    this.poleMesh.setPos(this.goalPos[0], this.goalPos[1]+0.6, this.goalPos[2]);
+
+    this.flagMesh = new Mesh(new VAO(gl, buildBox(0.5,0.3,0.04)), [0.9,0.15,0.15]);
+    this.flagMesh.setPos(this.goalPos[0]+0.28, this.goalPos[1]+1.15, this.goalPos[2]);
+  }
+
+  meshes() {
+    return [this.floorMesh, this.goalMesh, this.poleMesh, this.flagMesh];
+  }
+
+  checkGoal(ballPos) {
+    const dx = ballPos[0] - this.goalPos[0];
+    const dz = ballPos[2] - this.goalPos[2];
+    return Math.sqrt(dx*dx+dz*dz) < this.goalRadius && ballPos[1] < this.goalPos[1]+1.5;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HUD
+// Minimal HTML overlay. Just a timer — no stroke count, no par.
+// Runs independently of WebGL on top of the canvas.
+// ─────────────────────────────────────────────────────────────────────────────
+class HUD {
+  constructor() {
+    this._el      = document.getElementById('timer');
+    this._elapsed = 0;
+    this._running = false;
+  }
+  start()    { this._elapsed=0; this._running=true; }
+  stop()     { this._running=false; }
+  update(dt) {
+    if (!this._running) return;
+    this._elapsed += dt;
+    const m  = Math.floor(this._elapsed/60);
+    const s  = Math.floor(this._elapsed%60);
+    const ds = Math.floor((this._elapsed%1)*10);
+    this._el.textContent = `${m}:${String(s).padStart(2,'0')}.${ds}`;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Game
+// Top-level coordinator. Initialises all systems, owns the
+// requestAnimationFrame loop, and handles the goal-reached reset.
+// ─────────────────────────────────────────────────────────────────────────────
+class Game {
+  constructor() {
+    this.ctx      = new WebGLContext(document.getElementById('c'));
+    this.shader   = new Shader(this.ctx.gl, VERT, FRAG);
+    this.camera   = new Camera(this.ctx.aspect);
+    this.renderer = new Renderer(this.ctx, this.shader);
+    this.input    = new InputManager(this.ctx.canvas);
+    this.world    = new PhysicsWorld();
+    this.hud      = new HUD();
+    this.level    = new Level(this.ctx.gl);
+
+    // Ball — sphere mesh + rigid body
+    const gl = this.ctx.gl;
+    this.ballMesh = new Mesh(new VAO(gl, buildSphere(0.32)), [1.0,0.92,0.12]);
+    this.ballBody = new RigidBody(0.32);
+    this.world.addBody(this.ballBody);
+    this.world.addCollider(this.level.floorCol);
+
+    // Lights
+    this.lightDir = vec3.fromValues(-0.4,-1.0,-0.3);
+    this.lightCol = vec3.fromValues(1.0,0.95,0.85);
+    this.ptPos    = vec3.fromValues(0,20,-20);
+    this.ptCol    = vec3.fromValues(0.5,0.65,1.0);
+
+    this._last          = 0;
+    this._running       = false;
+    this._goalCooldown  = 0;
+    this._rollX         = 0;
+    this._rollZ         = 0;
+
+    window.addEventListener('resize', () => this.camera.setAspect(this.ctx.aspect));
+    document.getElementById('startBtn').addEventListener('click', () => this._start());
+  }
+
+  _start() {
+    document.getElementById('overlay').classList.add('hidden');
+    this._resetBall();
+    this.hud.start();
+    this._running = true;
+    this.input.activate();
+    requestAnimationFrame(t => this._loop(t));
+  }
+
+  _resetBall() {
+    vec3.set(this.ballBody.pos, ...this.level.ballStart);
+    vec3.set(this.ballBody.vel, 0, 0, 0);
+    vec3.set(this.ballBody._force, 0, 0, 0);
+    this.ballMesh.setScl(1,1,1);
+    this._rollX = 0;
+    this._rollZ = 0;
+  }
+
+  _loop(ts) {
+    if (!this._running) return;
+    const dt = Math.min((ts - this._last) / 1000, 0.05);
+    this._last = ts;
+    this._update(dt);
+    this._render();
+    requestAnimationFrame(t => this._loop(t));
+  }
+
+  _update(dt) {
+    // 1. Input → physics tilt
+    this.world.setMouseTilt(this.input.nx, this.input.ny);
+    this.world.step(dt);
+
+    // 2. Sync ball mesh to physics position
+    this.ballMesh.setPos(...this.ballBody.pos);
+
+    // 3. Rolling animation — rotate mesh based on velocity direction
+    const vx=this.ballBody.vel[0], vz=this.ballBody.vel[2];
+    const sp = Math.sqrt(vx*vx+vz*vz);
+    if (sp > 0.02) {
+      this._rollX += ( vz/sp) * sp * dt / this.ballBody.radius;
+      this._rollZ += (-vx/sp) * sp * dt / this.ballBody.radius;
+    }
+    this.ballMesh.setRot(this._rollX, 0, this._rollZ);
+
+    // 4. Out of bounds → respawn
+    if (this.ballBody.pos[1] < this.level.outY) this._resetBall();
+
+    // 5. Goal check → respawn at start (loop for MVP)
+    if (this._goalCooldown > 0) {
+      this._goalCooldown -= dt;
+    } else if (this.level.checkGoal(this.ballBody.pos)) {
+      this._resetBall();
+      this._goalCooldown = 1.5;
+    }
+
+    // 6. Update tilt matrix and camera
+    const { rx, rz } = this.world.tiltAngles();
+    this.renderer.setTilt(rx, rz, this.ballBody.pos);
+    this.camera.update(this.ballBody.pos, dt);
+    this.camera.setAspect(this.ctx.aspect);
+    this.hud.update(dt);
+  }
+
+  _render() {
+    this.renderer.frame(
+      this.level.meshes(),
+      this.ballMesh,
+      this.camera,
+      this.lightDir, this.lightCol,
+      this.ptPos,    this.ptCol
+    );
+  }
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+const game = new Game();
+</script>
+</body>
+</html>
